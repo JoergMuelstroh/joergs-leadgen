@@ -105,3 +105,7 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
+  console.log('✓ Joergs Leadgenerierung läuft auf http://localhost:' + PORT);
+});
+
+module.exports = app;
