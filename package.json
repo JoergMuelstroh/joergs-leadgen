@@ -1,0 +1,26 @@
+{
+  "name": "joergs-leadgenerierung",
+  "version": "1.0.0",
+  "description": "All-in-One Lead-Generation System für Baumaschinen-Verkauf",
+  "main": "joergs-leadgen.js",
+  "scripts": {
+    "start": "node joergs-leadgen.js",
+    "dev": "nodemon joergs-leadgen.js"
+  },
+  "keywords": ["lead-generation", "outreach", "automation"],
+  "author": "Jörg Mülstroh",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "axios": "^1.6.0",
+    "sqlite3": "^5.1.6",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
