@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: joergs-leadgen
+    env: node
+    buildCommand: npm install
+    startCommand: node joergs-leadgen.js
+    envVars:
+      - key: GOOGLE_MAPS_API_KEY
+        scope: build,runtime
+      - key: BREVO_API_KEY
+        scope: build,runtime
+      - key: PORT
+        value: 3000
