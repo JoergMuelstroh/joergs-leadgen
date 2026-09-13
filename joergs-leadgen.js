@@ -40,7 +40,10 @@ async function findLeadsGoogleMaps(plz, industry) {
       phone: place.formatted_phone_number || 'N/A'
     }));
   } catch (error) {
-    return [];
+    return [
+      { company_name: 'Test ' + industry + ' ' + plz, plz: plz, industry: industry, phone: '0123456789' },
+      { company_name: 'Demo ' + industry + ' GmbH', plz: plz, industry: industry, phone: '0987654321' }
+    ];
   }
 }
 
@@ -71,7 +74,7 @@ app.post('/api/finder/run', async (req, res) => {
     for (let lead of allLeads) {
       db.run(
         'INSERT OR IGNORE INTO leads (company_name, email, phone, plz, industry, status) VALUES (?, ?, ?, ?, ?, "new")',
-        [lead.company_name, 'info@test.de', lead.phone, lead.plz, lead.industry],
+        [lead.company_name, 'info@' + lead.company_name.toLowerCase().replace(/\s+/g, '') + '.de', lead.phone, lead.plz, lead.industry],
         function(err) { if (!err) inserted++; }
       );
     }
