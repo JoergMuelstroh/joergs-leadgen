@@ -71,13 +71,21 @@ app.post('/api/finder/run', async (req, res) => {
     }
     
     let inserted = 0;
-    for (let lead of allLeads) {
-      db.run(
-        'INSERT OR IGNORE INTO leads (company_name, email, phone, plz, industry, status) VALUES (?, ?, ?, ?, ?, "new")',
-        [lead.company_name, 'info@' + lead.company_name.toLowerCase().replace(/\s+/g, '') + '.de', lead.phone, lead.plz, lead.industry],
-        function(err) { if (!err) inserted++; }
-      );
-    }
+    
+    const promises = allLeads.map(lead => {
+      return new Promise((resolve) => {
+        db.run(
+          'INSERT OR IGNORE INTO leads (company_name, email, phone, plz, industry, status) VALUES (?, ?, ?, ?, ?, "new")',
+          [lead.company_name, 'info@' + lead.company_name.toLowerCase().replace(/\s+/g, '') + '.de', lead.phone, lead.plz, lead.industry],
+          function(err) { 
+            if (!err) inserted++;
+            resolve();
+          }
+        );
+      });
+    });
+    
+    await Promise.all(promises);
     
     res.json({ success: true, inserted: inserted });
   } catch (error) {
