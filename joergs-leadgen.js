@@ -2,24 +2,52 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const sqlite3 = require('sqlite3');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const db = new sqlite3.Database(':memory:');
+// Persistente Datei statt ':memory:' — Leads überleben jetzt einen normalen
+// Prozess-Neustart. WICHTIG: Render Free-Tier-Instanzen haben ein ephemeres
+// Dateisystem, das bei jedem Deploy und jedem Spin-down/Spin-up (Idle nach
+// ~15 Min) NEU aufgesetzt wird — dann ist auch diese Datei wieder leer. Für
+// echte Persistenz über Deploys/Idle-Zyklen hinweg braucht es entweder einen
+// Render Persistent Disk (kostenpflichtiger Plan) oder eine externe DB wie
+// Turso/Supabase. Sag Bescheid, wenn wir das als Nächstes anbinden sollen.
+const DATA_DIR = path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+const DB_PATH = path.join(DATA_DIR, 'leads.db');
+
+const db = new sqlite3.Database(DB_PATH, (err) => {
+  if (err) console.error('DB-Verbindung fehlgeschlagen:', err.message);
+  else console.log('SQLite-Datei geöffnet:', DB_PATH);
+});
 
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS leads (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     company_name TEXT,
     email TEXT UNIQUE,
     phone TEXT,
     plz TEXT,
     industry TEXT,
-    status TEXT DEFAULT 'new'
+    status TEXT DEFAULT 'new',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 });
+
+function shutdown() {
+  db.close((err) => {
+    if (err) console.error('Fehler beim Schließen der DB:', err.message);
+    else console.log('DB sauber geschlossen.');
+    process.exit(err ? 1 : 0);
+  });
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
 const CONFIG = {
   google_maps_api_key: process.env.GOOGLE_MAPS_API_KEY || 'YOUR_API_KEY',
@@ -48,14 +76,28 @@ async function findLeadsGoogleMaps(plz, industry) {
 }
 
 app.get('/api/stats', (req, res) => {
-  db.all('SELECT COUNT(*) as total FROM leads', (err, rows) => {
-    const total = (rows && rows[0]) ? rows[0].total : 0;
-    res.json({ total_leads: total, new_leads: total, contacted: 0 });
-  });
+  db.all(
+    `SELECT status, COUNT(*) as count FROM leads GROUP BY status`,
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+      const byStatus = {};
+      let total = 0;
+      for (const r of rows || []) {
+        byStatus[r.status] = r.count;
+        total += r.count;
+      }
+      res.json({
+        total_leads: total,
+        new_leads: byStatus['new'] || 0,
+        contacted: byStatus['contacted'] || 0
+      });
+    }
+  );
 });
 
 app.get('/api/leads', (req, res) => {
-  db.all('SELECT * FROM leads LIMIT 50', (err, rows) => {
+  db.all('SELECT * FROM leads ORDER BY created_at DESC LIMIT 50', (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
     res.json(rows || []);
   });
 });
