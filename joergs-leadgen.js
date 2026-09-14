@@ -60,10 +60,14 @@ const CONFIG = {
   google_maps_api_key: process.env.GOOGLE_MAPS_API_KEY || '',
   target_plz: ['35', '50', '51', '53', '54', '55', '56', '57', '60', '61', '63', '64', '65', '66', '67'],
   industries: ['Bauunternehmen', 'Tiefbau', 'Straßenbau', 'Asphaltbau', 'Erdbeweger', 'Gewinnungsbetriebe'],
-  // Jede Place-Details-Anfrage (für Telefon/Website) kostet extra Google-API-
-  // Budget. Deckel pro Finder-Lauf, damit ein Klick nicht versehentlich
-  // hunderte kostenpflichtige Details-Calls auslöst. Per Env überschreibbar.
-  max_details_per_run: parseInt(process.env.MAX_DETAILS_PER_RUN || '30', 10)
+  // Jede Place-Details-Anfrage (Telefon/Website) kostet ca. $3 pro 1000 Calls
+  // (Google "Contact Data", Stand 2026) — bei max. 840 möglichen Leads pro
+  // vollem Lauf (14 PLZ x 6 Branchen x bis zu 10 Treffer) sind das im
+  // Extremfall ca. $2,50 pro Lauf, meist deutlich weniger, weil Duplikate
+  // jetzt VOR der Details-Anfrage rausgefiltert werden. Der Text-Search-Call
+  // selbst (ca. $32/1000) läuft für jede PLZ+Branche-Kombination sowieso,
+  // unabhängig von diesem Deckel. Per Env überschreibbar.
+  max_details_per_run: parseInt(process.env.MAX_DETAILS_PER_RUN || '200', 10)
 };
 
 // Ohne echten Key läuft die App im Demo-Modus mit klar markierten Fake-Leads
@@ -95,7 +99,7 @@ async function fetchPlaceDetails(placeId) {
   }
 }
 
-async function findLeadsGoogleMaps(plz, industry, detailsBudget) {
+async function findLeadsGoogleMaps(plz, industry) {
   if (DEMO_MODE) {
     return [
       { place_id: null, company_name: `Test ${industry} ${plz}`, address: null, website: null, plz, industry, phone: '0123456789', demo: true },
@@ -122,26 +126,30 @@ async function findLeadsGoogleMaps(plz, industry, detailsBudget) {
   const results = (response.data.results || []).slice(0, 10);
   const leads = [];
   for (const place of results) {
-    let phone = null;
-    let website = null;
-    if (detailsBudget.remaining > 0) {
-      const details = await fetchPlaceDetails(place.place_id);
-      phone = details.phone;
-      website = details.website;
-      detailsBudget.remaining--;
-    }
     leads.push({
       place_id: place.place_id,
       company_name: place.name,
       address: place.formatted_address || null,
-      website,
+      website: null,
       plz,
       industry,
-      phone,
+      phone: null,
       demo: false
     });
   }
   return leads;
+}
+
+// Details (Telefon/Website) NUR für Leads holen, die wir noch nicht kennen —
+// vorher wurde das Budget schon bei den ersten PLZ verbraucht, sodass die
+// später verarbeiteten PLZ nie Details bekamen, unabhängig davon ob sie neu
+// oder Duplikate waren. Jetzt: erst auf "ist das neu?" prüfen (kostenlos),
+// dann erst die kostenpflichtige Details-Anfrage für die neuen ausgeben.
+async function enrichWithDetails(lead, detailsBudget) {
+  if (lead.demo || !lead.place_id || detailsBudget.remaining <= 0) return lead;
+  const details = await fetchPlaceDetails(lead.place_id);
+  detailsBudget.remaining--;
+  return { ...lead, phone: details.phone, website: details.website };
 }
 
 function leadExists(lead) {
@@ -211,12 +219,13 @@ app.post('/api/finder/run', async (req, res) => {
 
     for (const plz of CONFIG.target_plz) {
       for (const industry of CONFIG.industries) {
-        const leads = await findLeadsGoogleMaps(plz, industry, detailsBudget);
-        for (const lead of leads) {
+        const leads = await findLeadsGoogleMaps(plz, industry);
+        for (let lead of leads) {
           if (await leadExists(lead)) {
             skipped++;
             continue;
           }
+          lead = await enrichWithDetails(lead, detailsBudget);
           await insertLead(lead);
           inserted++;
         }
