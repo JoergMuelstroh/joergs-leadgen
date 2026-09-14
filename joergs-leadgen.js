@@ -33,6 +33,8 @@ db.serialize(() => {
     address TEXT,
     website TEXT,
     email TEXT,
+    email_status TEXT,
+    email_source TEXT,
     phone TEXT,
     plz TEXT,
     industry TEXT,
@@ -44,6 +46,11 @@ db.serialize(() => {
   // weil in echten Daten beide erstmal NULL sein können (Email kommt erst aus
   // dem Enrichment-Schritt). Duplikate werden stattdessen aktiv vor dem
   // Insert per place_id bzw. company_name+plz geprüft (siehe leadExists()).
+  //
+  // email_status: null/leer = noch nicht versucht, 'found' = Email gefunden,
+  // 'not_found' = versucht, aber keine Email auf Homepage/Impressum entdeckt.
+  // Verhindert, dass derselbe Lead bei jedem Enrichment-Lauf erneut gecrawlt
+  // wird. email_source sagt, wo die Email herkam (homepage/impressum).
 });
 
 function shutdown() {
@@ -212,6 +219,113 @@ function insertLead(lead) {
   });
 }
 
+// --- Email-Enrichment: Homepage + Impressum nach echter Email durchsuchen ---
+// Kein Rätselraten mehr ("info@" + Firmenname + ".de", das oft gar nicht
+// existierte) - stattdessen wird die tatsächlich hinterlegte Website
+// gecrawlt. In Deutschland ist eine Kontakt-Email im Impressum Pflicht, das
+// macht diesen Weg zuverlässiger als reines Homepage-Scraping.
+const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+const JUNK_EMAIL_PATTERNS = [
+  /wixpress\.com$/i, /sentry\.io$/i, /example\.(com|de)$/i, /godaddy\.com$/i,
+  /schema\.org$/i, /\.(png|jpg|jpeg|gif|svg|webp)$/i, /wordpress\.(com|org)$/i
+];
+
+function extractEmails(html) {
+  const matches = (html || '').match(EMAIL_REGEX) || [];
+  const seen = new Set();
+  const clean = [];
+  for (const raw of matches) {
+    const m = raw.toLowerCase();
+    if (JUNK_EMAIL_PATTERNS.some((p) => p.test(m))) continue;
+    if (seen.has(m)) continue;
+    seen.add(m);
+    clean.push(m);
+  }
+  return clean;
+}
+
+function findImpressumUrl(html, baseUrl) {
+  const hrefRegex = /href\s*=\s*["']([^"'#]+)["']/gi;
+  let match;
+  while ((match = hrefRegex.exec(html || '')) !== null) {
+    if (/impressum|imprint/i.test(match[1])) {
+      try { return new URL(match[1], baseUrl).href; } catch { /* ungültige URL, ignorieren */ }
+    }
+  }
+  return null;
+}
+
+async function fetchHtml(url) {
+  const response = await axios.get(url, {
+    timeout: 8000,
+    maxRedirects: 5,
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; JoergsLeadgenBot/1.0)' },
+    validateStatus: (s) => s < 500 // 4xx trotzdem auswerten statt zu werfen
+  });
+  return typeof response.data === 'string' ? response.data : '';
+}
+
+async function findEmailForWebsite(website) {
+  let baseUrl;
+  try {
+    baseUrl = new URL(website).href;
+  } catch {
+    return { email: null, source: null };
+  }
+
+  let homepageHtml;
+  try {
+    homepageHtml = await fetchHtml(baseUrl);
+  } catch (error) {
+    return { email: null, source: null, error: error.message };
+  }
+
+  const homepageEmails = extractEmails(homepageHtml);
+  if (homepageEmails.length > 0) {
+    return { email: homepageEmails[0], source: 'homepage' };
+  }
+
+  const impressumUrl = findImpressumUrl(homepageHtml, baseUrl);
+  if (impressumUrl) {
+    try {
+      const impressumHtml = await fetchHtml(impressumUrl);
+      const impressumEmails = extractEmails(impressumHtml);
+      if (impressumEmails.length > 0) {
+        return { email: impressumEmails[0], source: 'impressum' };
+      }
+    } catch {
+      // Impressum nicht erreichbar - kein Absturz, einfach kein Ergebnis
+    }
+  }
+
+  return { email: null, source: null };
+}
+
+function getLeadsNeedingEmail(limit) {
+  return new Promise((resolve, reject) => {
+    db.all(
+      `SELECT id, website FROM leads
+       WHERE website IS NOT NULL AND (email_status IS NULL OR email_status = '')
+       ORDER BY created_at DESC LIMIT ?`,
+      [limit],
+      (err, rows) => {
+        if (err) return reject(err);
+        resolve(rows || []);
+      }
+    );
+  });
+}
+
+function updateLeadEmail(id, email, emailStatus, emailSource) {
+  return new Promise((resolve, reject) => {
+    db.run(
+      `UPDATE leads SET email = ?, email_status = ?, email_source = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [email, emailStatus, emailSource, id],
+      (err) => (err ? reject(err) : resolve())
+    );
+  });
+}
+
 app.get('/api/stats', (req, res) => {
   db.all(
     `SELECT status, COUNT(*) as count FROM leads GROUP BY status`,
@@ -223,12 +337,19 @@ app.get('/api/stats', (req, res) => {
         byStatus[r.status] = r.count;
         total += r.count;
       }
-      res.json({
-        total_leads: total,
-        new_leads: byStatus['new'] || 0,
-        contacted: byStatus['contacted'] || 0,
-        demo_mode: DEMO_MODE
-      });
+      db.get(
+        `SELECT COUNT(*) as cnt FROM leads WHERE website IS NOT NULL AND (email_status IS NULL OR email_status = '')`,
+        (err2, row2) => {
+          if (err2) return res.status(500).json({ error: err2.message });
+          res.json({
+            total_leads: total,
+            new_leads: byStatus['new'] || 0,
+            contacted: byStatus['contacted'] || 0,
+            pending_email: row2 ? row2.cnt : 0,
+            demo_mode: DEMO_MODE
+          });
+        }
+      );
     }
   );
 });
@@ -274,8 +395,37 @@ app.post('/api/finder/run', async (req, res) => {
   }
 });
 
+app.post('/api/enrich/run', async (req, res) => {
+  try {
+    // Bewusst als eigener Schritt statt Teil von /api/finder/run: Crawlen von
+    // Dutzenden fremden Websites nacheinander würde den Finder-Request sonst
+    // sehr lange blockieren. So kann man in überschaubaren Batches nachladen.
+    const batchSize = Math.min(parseInt(req.body && req.body.limit, 10) || 50, 200);
+    const leads = await getLeadsNeedingEmail(batchSize);
+
+    let found = 0;
+    let notFound = 0;
+    for (const lead of leads) {
+      const result = await findEmailForWebsite(lead.website);
+      if (result.email) {
+        await updateLeadEmail(lead.id, result.email, 'found', result.source);
+        found++;
+      } else {
+        await updateLeadEmail(lead.id, null, 'not_found', null);
+        notFound++;
+      }
+      await sleep(300); // Höflichkeitspause zwischen Anfragen an fremde Websites
+    }
+
+    res.json({ success: true, processed: leads.length, found, not_found: notFound });
+  } catch (error) {
+    console.error('Email-Enrichment fehlgeschlagen:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/', (req, res) => {
-  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Joergs Leadgenerierung</title><style>body{font-family:Arial;background:#f5f5f5;margin:0}.container{max-width:1200px;margin:0 auto;padding:20px}header{background:#1a1a1a;color:#fff;padding:20px;border-radius:8px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center}h1{margin:0;font-size:28px}.badge{background:#e67e22;color:#fff;padding:4px 10px;border-radius:12px;font-size:12px;font-weight:bold}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:15px;margin:20px 0}.stat{background:#fff;padding:20px;border-radius:8px;border-left:4px solid #4CAF50;text-align:center}.number{font-size:32px;font-weight:bold;color:#4CAF50}.label{font-size:12px;color:#666;margin-top:10px}button{background:#4CAF50;color:#fff;border:none;padding:12px 20px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:16px;margin:20px 0}button:disabled{opacity:.6}button:hover:not(:disabled){background:#45a049}table{width:100%;border-collapse:collapse;background:#fff;margin-top:20px}th,td{padding:12px;text-align:left;border-bottom:1px solid #ddd}th{background:#f0f0f0;font-weight:bold}.message{padding:12px;margin-bottom:15px;border-radius:5px;background:#d4edda;color:#155724;display:none}.message.show{display:block}</style></head><body><div class="container"><header><h1>🚀 Joergs Leadgenerierung</h1><span class="badge" id="demoBadge" style="display:none">DEMO-MODUS</span></header><div class="message" id="msg"></div><div class="stats"><div class="stat"><div class="number" id="total">0</div><div class="label">Gesamt Leads</div></div><div class="stat"><div class="number" id="new">0</div><div class="label">Neue Leads</div></div><div class="stat"><div class="number" id="contacted">0</div><div class="label">Kontaktiert</div></div></div><button id="btn" onclick="runFinder()">🔍 Finder starten</button><h2>Leads</h2><p id="leadCount" style="color:#666;font-size:14px"></p><div id="table-container"></div></div><script>async function load(){try{const r1=await fetch('/api/stats');const s=await r1.json();document.getElementById('total').textContent=s.total_leads;document.getElementById('new').textContent=s.new_leads;document.getElementById('contacted').textContent=s.contacted;document.getElementById('demoBadge').style.display=s.demo_mode?'inline-block':'none';const r2=await fetch('/api/leads?limit=5000');const leads=await r2.json();document.getElementById('leadCount').textContent='Zeige '+leads.length+' von '+s.total_leads+' Leads';let html='';if(leads.length===0){html='<p>Keine Leads - Finder starten!</p>'}else{html='<table><tr><th>Unternehmen</th><th>Adresse</th><th>Website</th><th>Telefon</th><th>Branche</th><th>PLZ</th></tr>';for(let l of leads){html+='<tr><td>'+l.company_name+'</td><td>'+(l.address||'–')+'</td><td>'+(l.website?('<a href="'+l.website+'" target="_blank" rel="noopener">Link</a>'):'–')+'</td><td>'+(l.phone||'–')+'</td><td>'+l.industry+'</td><td>'+l.plz+'</td></tr>'}html+='</table>'}document.getElementById('table-container').innerHTML=html}catch(e){console.error(e)}}async function runFinder(){const btn=document.getElementById('btn');const msg=document.getElementById('msg');btn.disabled=true;btn.textContent='Läuft...';msg.classList.remove('show');try{const r=await fetch('/api/finder/run',{method:'POST'});const d=await r.json();msg.textContent=d.success?('✓ '+d.inserted+' neue Leads, '+d.skipped+' Duplikate, '+(d.plz_mismatch||0)+' falsche PLZ verworfen'+(d.demo_mode?' (Demo-Modus)':'')):('✗ '+(d.error||'Fehler'));msg.classList.add('show');setTimeout(()=>{load();btn.disabled=false;btn.textContent='🔍 Finder starten'},2000)}catch(e){msg.textContent='✗ Error';msg.classList.add('show');btn.disabled=false;btn.textContent='🔍 Finder starten'}}load()</script></body></html>`);
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Joergs Leadgenerierung</title><style>body{font-family:Arial;background:#f5f5f5;margin:0}.container{max-width:1200px;margin:0 auto;padding:20px}header{background:#1a1a1a;color:#fff;padding:20px;border-radius:8px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center}h1{margin:0;font-size:28px}.badge{background:#e67e22;color:#fff;padding:4px 10px;border-radius:12px;font-size:12px;font-weight:bold}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:15px;margin:20px 0}.stat{background:#fff;padding:20px;border-radius:8px;border-left:4px solid #4CAF50;text-align:center}.number{font-size:32px;font-weight:bold;color:#4CAF50}.label{font-size:12px;color:#666;margin-top:10px}button{background:#4CAF50;color:#fff;border:none;padding:12px 20px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:16px;margin:20px 0}button:disabled{opacity:.6}button:hover:not(:disabled){background:#45a049}table{width:100%;border-collapse:collapse;background:#fff;margin-top:20px}th,td{padding:12px;text-align:left;border-bottom:1px solid #ddd}th{background:#f0f0f0;font-weight:bold}.message{padding:12px;margin-bottom:15px;border-radius:5px;background:#d4edda;color:#155724;display:none}.message.show{display:block}</style></head><body><div class="container"><header><h1>🚀 Joergs Leadgenerierung</h1><span class="badge" id="demoBadge" style="display:none">DEMO-MODUS</span></header><div class="message" id="msg"></div><div class="stats"><div class="stat"><div class="number" id="total">0</div><div class="label">Gesamt Leads</div></div><div class="stat"><div class="number" id="new">0</div><div class="label">Neue Leads</div></div><div class="stat"><div class="number" id="contacted">0</div><div class="label">Kontaktiert</div></div></div><button id="btn" onclick="runFinder()">🔍 Finder starten</button><button id="enrichBtn" onclick="runEnrich()">📧 Emails suchen (<span id="pendingEmail">0</span> wartend)</button><h2>Leads</h2><p id="leadCount" style="color:#666;font-size:14px"></p><div id="table-container"></div></div><script>async function load(){try{const r1=await fetch('/api/stats');const s=await r1.json();document.getElementById('total').textContent=s.total_leads;document.getElementById('new').textContent=s.new_leads;document.getElementById('contacted').textContent=s.contacted;document.getElementById('demoBadge').style.display=s.demo_mode?'inline-block':'none';document.getElementById('pendingEmail').textContent=s.pending_email||0;const r2=await fetch('/api/leads?limit=5000');const leads=await r2.json();document.getElementById('leadCount').textContent='Zeige '+leads.length+' von '+s.total_leads+' Leads';let html='';if(leads.length===0){html='<p>Keine Leads - Finder starten!</p>'}else{html='<table><tr><th>Unternehmen</th><th>Adresse</th><th>Website</th><th>Email</th><th>Telefon</th><th>Branche</th><th>PLZ</th></tr>';for(let l of leads){html+='<tr><td>'+l.company_name+'</td><td>'+(l.address||'–')+'</td><td>'+(l.website?('<a href="'+l.website+'" target="_blank" rel="noopener">Link</a>'):'–')+'</td><td>'+(l.email||(l.email_status==='not_found'?'<span style=\'color:#999\'>keine gefunden</span>':'–'))+'</td><td>'+(l.phone||'–')+'</td><td>'+l.industry+'</td><td>'+l.plz+'</td></tr>'}html+='</table>'}document.getElementById('table-container').innerHTML=html}catch(e){console.error(e)}}async function runFinder(){const btn=document.getElementById('btn');const msg=document.getElementById('msg');btn.disabled=true;btn.textContent='Läuft...';msg.classList.remove('show');try{const r=await fetch('/api/finder/run',{method:'POST'});const d=await r.json();msg.textContent=d.success?('✓ '+d.inserted+' neue Leads, '+d.skipped+' Duplikate, '+(d.plz_mismatch||0)+' falsche PLZ verworfen'+(d.demo_mode?' (Demo-Modus)':'')):('✗ '+(d.error||'Fehler'));msg.classList.add('show');setTimeout(()=>{load();btn.disabled=false;btn.textContent='🔍 Finder starten'},2000)}catch(e){msg.textContent='✗ Error';msg.classList.add('show');btn.disabled=false;btn.textContent='🔍 Finder starten'}}async function runEnrich(){const btn=document.getElementById('enrichBtn');const msg=document.getElementById('msg');btn.disabled=true;const oldText=btn.innerHTML;btn.textContent='Sucht...';msg.classList.remove('show');try{const r=await fetch('/api/enrich/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:50})});const d=await r.json();msg.textContent=d.success?('✓ '+d.found+' Emails gefunden, '+d.not_found+' ohne Treffer (von '+d.processed+' geprüft)'):('✗ '+(d.error||'Fehler'));msg.classList.add('show');setTimeout(()=>{load();btn.disabled=false;btn.innerHTML=oldText},2000)}catch(e){msg.textContent='✗ Error';msg.classList.add('show');btn.disabled=false;btn.innerHTML=oldText}}load()</script></body></html>`);
 });
 
 const PORT = process.env.PORT || 3000;
