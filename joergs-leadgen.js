@@ -66,8 +66,17 @@ const CONFIG = {
   // Extremfall ca. $2,50 pro Lauf, meist deutlich weniger, weil Duplikate
   // jetzt VOR der Details-Anfrage rausgefiltert werden. Der Text-Search-Call
   // selbst (ca. $32/1000) läuft für jede PLZ+Branche-Kombination sowieso,
-  // unabhängig von diesem Deckel. Per Env überschreibbar.
-  max_details_per_run: parseInt(process.env.MAX_DETAILS_PER_RUN || '200', 10)
+  // unabhängig von diesem Deckel.
+  //
+  // Praktisch kein Deckel mehr (Default 100000): ein Budget, das während
+  // des Laufs ausgeht, trifft IMMER die zuerst verarbeiteten PLZ (35, 50...)
+  // zuerst - genau die, die im Dashboard zuletzt angezeigt werden (neueste
+  // oben). Bei jedem endlichen Deckel unter der Gesamtzahl gehen also
+  // ausgerechnet die Leads leer aus, die man sich zuerst anschaut. Da die
+  // echten Kosten pro Lauf im niedrigen einstelligen Dollarbereich liegen,
+  // lohnt sich das Kosten-Risiko eines Deckels hier nicht. Per Env trotzdem
+  // einstellbar, falls gewünscht.
+  max_details_per_run: parseInt(process.env.MAX_DETAILS_PER_RUN || '100000', 10)
 };
 
 // Ohne echten Key läuft die App im Demo-Modus mit klar markierten Fake-Leads
